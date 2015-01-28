@@ -1,0 +1,409 @@
+;==============================================================================
+;
+;  METHOD
+;		align_dynamic_petctrois
+;
+;  DESCRIPTION
+;		Reads dynamic PET/CT and RT structure set data and saves all in mk
+;		format.  PET/CT data may be in DICOM or Philips native format.
+;		RT structure sets must be in DICOM format.
+;		To begin, PETs are aligned and resized to their respective CTs using
+;		header position info.  RT structure sets are also decoded in CT space.
+;
+;  SYNTAX
+;		 bOk = align_dynamic_petctrois()
+;
+;  INPUTS
+;   See user_prefs.pro for a description of the directories, filters and
+;   other keywords used by the program.
+;
+;  OUTPUTS
+;		Aligned PET, CT (ints) and ROI (bytes) data arrays and
+;		corresponding text files with image and pixel dimensions, frame times
+;		and alignment parameters:
+;			<patId>_<Pre or Intra>_CT.img/_info.txt
+;     <patId>_<Pre or Intra>_PET.img/_info.txt
+;     <patId>_<Pre or Intra>_<roi name>.img/_info.txt
+;   e.g., S-068_Pre_CT.img
+;
+;  REQUIRED MODULES
+;   user_prefs
+;		getPetCtROIs
+;		alignDataSets
+;		textbox
+;		coreg2petCtRois
+;		contour_mask
+;		dcm2rawNonUniform
+;		gemini2raw
+;		read_rs
+;		align_pet2ct
+;		align_ct2pet
+;		dialog_select
+;		select_contours
+;		allo_volume_read
+;		idl_mhdr_struct
+;		idl_subhdr_struct
+;		idl_exthdr_struct
+;
+;  WRITTEN BY
+;		Maggie Kusano, April 10, 2012
+;
+;  VERSION
+;		071112
+;		Version adapted from get_pet_ct_slope
+;
+;		071123
+;		Version used to generate data sent to Huan on 071116.
+;
+;		090306
+;		Version used for Ian Poon's CARO abstract.
+;
+;		090824
+;		Reversed alignment (now align pre to intra) for Mike.
+;
+;		090829
+;		Version passed to Mike.
+;
+;		120410
+;		Version for PVC of carotids. Removed coregistration of pre- and intra-.
+;
+;		130731
+;		Version for SKA-M analysis. Changed from pro to function to allow
+;		for batch runs.
+;
+;==============================================================================
+
+function align_dynamic_petctrois, $
+	CTFILE=ctFile, $				      ; In (opt)
+	PETFILE=petFile, $				    ; In (opt)
+	RSFILE=rsFile, $				      ; In (opt)
+	CTPATNAME=ctPatName, $			  ; Out (opt)
+	CTSTUDYDATE=ctStudyDate, $		; Out (opt)
+	PETPATNAME=petPatName, $		  ; Out (opt)
+	PETSTUDYDATE=petStudyDate, $	; Out (opt)
+	RSPATNAME=rsPatName, $			  ; Out (opt)
+	RSSTUDYDATE=rsStudyDate, $		; Out (opt)
+	EXIT_MESSAGE=exitMessage		  ; Out (opt)
+
+@ user_prefs
+
+;==============================================================================
+;
+;	Get PET/CT data
+;
+; CT.
+if not keyword_set( ctFile ) then begin
+	; Prompt for CT data.
+	ctPath = READ_DIR+ct_DIR
+	ctFile = (file_search( ctPath+ct_FILTER , COUNT=count ))[0]
+	if count eq 0 then begin
+		ctFile = dialog_pickfile( PATH=ctPath, $
+				GET_PATH=ctPath, $
+				FILTER=['*.img', '*.*.img', '*.syn', '*.dcm'], $
+				TITLE='Select a single pre-treatment CT file' )
+		if ctFile eq '' then return, 0b
+	endif
+endif else begin
+	files = file_search( ctFile, COUNT=count )
+	if count eq 0 then begin
+		exitMessage = 'CT data not found.'
+		return, 0b
+	endif
+endelse
+
+; Get patient time (pre or intra) and patient id from file path
+parts = strsplit( file_dirname( ctFile ), '\', /EXTRACT, COUNT=nParts )
+patId = parts[nParts-1]
+time = parts[nParts-2]
+
+; PET.
+if not keyword_set( petFile ) then begin
+	; Prompt for PET data.
+	petPath = READ_DIR+pet_DIR+time+'\'+patId+'\'
+	petFile = (file_search( petPath+pet_FILTER, COUNT=count ))[0]
+	if count eq 0 then begin
+		petFile = dialog_pickfile( PATH=petPath, $
+				GET_PATH=petPath, $
+				FILTER=['*.img', '*.*.img', '*.syn', '*.dcm'], $
+				TITLE='Select a single pre-treatment PET file' )
+		if petFile eq '' then return, 0b
+	endif
+endif else begin
+	files = file_search( petFile, COUNT=count )
+	if count eq 0 then begin
+		exitMessage = 'PET data not found.'
+		return, 0b
+	endif
+endelse
+
+; Contours.
+if not keyword_set( rsFile ) then begin
+	; Prompt for RS data.
+	rsPath = READ_DIR+rs_DIR+time+'\'+patId+'\'
+	rsFile = (file_search( rsPath, rs_FILTER, COUNT=count ))[0]
+	if count ne 1 then begin
+		rsFile = dialog_pickfile( PATH=rsPath, $
+				FILTER=['*.dcm','*.img'], $
+				TITLE='Select pre-treatment contour file' )
+	endif
+endif else begin
+	files = file_search( rsFile, COUNT=count )
+	if count eq 0 then begin
+		exitMessage = 'RS data not found.'
+		return, 0b
+	endif
+endelse
+
+petDataFile = TEMP_DIR+'pet.tmp'
+roiDataFile = TEMP_DIR+'rois.tmp'
+
+bOk = getPetCtRois( $
+		PET_FILE=petFile, $
+		PET_ASSOC_FILE=petDataFile, $
+		PET_DIMS=petDims, $
+		PET_PIXSIZE=petPixSize, $
+		PET_FRAME_START=startTimes, $
+		PET_FRAME_END=endTimes, $
+		PET_POS=petPos, $
+		PET_SCL=petScl, $
+		PET_PATNAME=petPatName, $
+		PET_STUDYDATE=petStudyDate, $
+		WEIGHT=weight, $
+		ACTIVITY=activity, $
+		CT_FILE=ctFile, $
+		CT_DATA=pCt, $
+		CT_DIMS=ctDims, $
+		CT_PIXSIZE=ctPixSize, $
+		CT_PATNAME=ctPatName, $
+		CT_STUDYDATE=ctStudyDate, $
+		ROI_FILE=rsFile, $
+		ROI_ASSOC_FILE=roiDataFile, $
+		ROI_COUNT=nRois, $
+		ROI_NAMES=roiNames, $
+		ROI_PATNAME=rsPatName, $
+		ROI_STUDYDATE=rsStudyDate, $
+		/COREG2CT )
+
+if not bOk then begin
+	if ptr_valid( pCt ) then ptr_free, pCt
+	file_delete, petDataFile, roiDataFile, /ALLOW_NONEXISTENT
+	return, 0b
+endif
+
+; Flip images (they're upside-down)
+*pCt = reverse( temporary( *pCt ), 2 )
+openu, petLun, /GET_LUN, petDataFile
+tmppet = assoc( petLun, intarr( ctDims ) )
+for iFrame=0, n_elements(startTimes)-1 do begin
+	tmppet[iFrame] = reverse( temporary( tmppet[iFrame] ), 2 )
+endfor
+tmppet = 0
+free_lun, petLun
+
+openu, roiLun, /GET_LUN, roiDataFile
+rois = assoc( roiLun, bytarr( ctDims ) )
+for iROI=0, nROIs-1 do begin
+	tmp = reverse( rois[iRoi], 2 )
+	rois[iRoi] = tmp
+endfor
+rois = 0
+tmp = 0
+free_lun, roiLun
+
+;==============================================================================
+;
+;	Display images
+;
+if bDISPLAY then begin
+
+  ; Reset display and load grayscale colour table
+  device, DECOMPOSED=0
+  loadct, 0, /SILENT
+  topClr = !D.TABLE_SIZE-1
+  
+  ; Display images
+  roiMask = bytarr( ctDims )
+  if nROIs ne 0 then begin
+  	openr, lun, /GET_LUN, roiDataFile
+  	rois = assoc( lun, bytarr( ctDims ) )
+  	for iROI=0, nROIs-1 do begin
+  		roiMask = roiMask or (rois[iROI] gt 0)
+  	endfor
+  	close, lun & free_lun, lun
+  endif
+  dispImg = bytscl( *pCt, TOP=254 )
+  
+  ; Contour pre ROIs for display, if any
+  void = where( roiMask ne 0, count )
+  if count ne 0 then begin
+  	for iSlice=0, ctDims[2]-1 do begin
+  		slice = roiMask[*,*,iSlice]
+  		dispSlice = dispImg[*,*,iSlice]
+  		indices = where( slice ne 0, count )
+  		if count eq 0 then continue
+  		contIndices = contour_mask( slice, /INDICES )
+  		dispSlice[contIndices] = 255b
+  		dispImg[0,0,iSlice] = dispSlice
+  	endfor
+  endif
+  tv3d, dispImg, RED=255, TITLE='CT & contours'
+
+endif ; bDISPLAY
+
+;==============================================================================
+;
+;	Write images
+;
+if bWRITEIMAGES or bWRITEROIs then begin
+
+	print, 'Writing images for patient ', patId
+
+	julian = systime( /JULIAN )
+	caldat, julian, month, day, year, hour, minute, second
+	curTime = '_' + string( year, month, day, hour, minute, second, $
+			FORMAT='(I4, 5I2)' )
+	curTime = strjoin( strsplit( curTime, ' ', /EXTRACT ), '0' )
+
+  ; Make sure user_prefs WRITE_DIR exists. Prompt if it doesn't.
+  writeDir = file_search( WRITE_DIR, COUNT=bFound )
+  if bFound ne 1 then begin
+    writeDir = dialog_pickfile( /DIRECTORY, TITLE='Select folder to write to', $
+        PATH=MAIN_DIR )
+    if writeDir eq '' then begin
+      exitMessage = 'Write path not selected. Data not written.'
+      void = dialog_message( /ERROR, exitMessage )
+      return, 0b
+    endif
+    writeDir = writeDir + '\'
+  endif else begin
+    writeDir = WRITE_DIR
+  endelse
+
+endif
+
+; Write PET/CT data in MK format.
+if bWRITEIMAGES then begin
+
+	; Check for existing files
+	fileName = writeDir + patId + '_' + time + '_CT.img'
+	foundFiles = file_search( fileName, COUNT=nFiles )
+	suffix = ''
+	if nFiles gt 0 then suffix = curTime
+
+	; Write CT
+	preCTFileName = writeDir + patId + '_' + time + suffix + '_CT.img'
+	openw, fileOutUnit, preCTFileName, /GET_LUN
+	writeu, fileOutUnit, (*pCt)
+	close, fileOutUnit & free_lun, fileOutUnit
+	fileBase = (strsplit( file_basename( preCTFileName ), ".", /EXTRACT ))[0]
+	txtFileName = writeDir + fileBase + '_info.txt'
+	openw, txtFileOutUnit, txtFileName, /GET_LUN
+	printf, txtFileOutUnit, "Image Info"
+	printf, txtFileOutUnit, "=========="
+	printf, txtFileOutUnit, "nPx = ", strtrim( ctDims[0], 2 )
+	printf, txtFileOutUnit, "nPy = ", strtrim( ctDims[1], 2 )
+	printf, txtFileOutUnit, "nSlices = ", strtrim( ctDims[2], 2 )
+	printf, txtFileOutUnit, "pixSizeX (mm) = ", strtrim( ctPixSize[0], 2 )
+	printf, txtFileOutUnit, "pixSizeY (mm) = ", strtrim( ctPixSize[1], 2 )
+	printf, txtFileOutUnit, "pixSizeZ (mm) = ", strtrim( ctPixSize[2], 2 )
+	printf, txtFileOutUnit, "type = ", strtrim( size( (*pCt), /TYPE ) )
+	printf, txtFileOutUnit, "type name = ", strtrim( size( (*pCt), /TNAME ) )
+	close, txtFileOutUnit & free_lun, txtFileOutUnit
+
+	; Check for existing files
+	fileName = writeDir + patId + '_' + time + '_PET.img'
+	foundFiles = file_search( fileName, COUNT=nFiles )
+	suffix = ''
+	if nFiles gt 0 then suffix = curTime
+
+
+	; Write PET
+	fileName = writeDir + patId + '_' + time + suffix + '_PET.img'
+	file_copy, petDataFile, fileName, /OVERWRITE
+	fileBase = (strsplit( file_basename( fileName ), ".", /EXTRACT ))[0]
+	txtFileName = writeDir + fileBase + '_info.txt'
+	openw, txtFileOutUnit, txtFileName, /GET_LUN
+	printf, txtFileOutUnit, "Image Info"
+	printf, txtFileOutUnit, "=========="
+	printf, txtFileOutUnit, "nPx = ", strtrim( ctDims[0], 2 )
+	printf, txtFileOutUnit, "nPy = ", strtrim( ctDims[1], 2 )
+	printf, txtFileOutUnit, "nSlices = ", strtrim( ctDims[2], 2 )
+	printf, txtFileOutUnit, "pixSizeX (mm) = ", strtrim( ctPixSize[0], 2 )
+	printf, txtFileOutUnit, "pixSizeY (mm) = ", strtrim( ctPixSize[1], 2 )
+	printf, txtFileOutUnit, "pixSizeZ (mm) = ", strtrim( ctPixSize[2], 2 )
+	printf, txtFileOutUnit, "type = ", strtrim( size( (*pCt), /TYPE ) )
+	printf, txtFileOutUnit, "type name = ", strtrim( size( (*pCt), /TNAME ) )
+	printf, txtFileOutUnit, "nFrames = ", strtrim( n_elements(startTimes), 2 )
+	printf, txtFileOutUnit, "frame start times (s) = " + strjoin( strtrim(startTimes,2), ', ' )
+	printf, txtFileOutUnit, "frame end times (s) = " + strjoin( strtrim(endTimes,2), ', ' )
+	printf, txtFileOutUnit, "suv scale = " + strjoin( strtrim(petScl,2), ', ' )
+	printf, txtFileOutUnit, "weight (g) = " + strtrim( weight, 2 )
+	printf, txtFileOutUnit, "injected activity (MBq) = " + strtrim( activity, 2 )
+	free_lun, txtFileOutUnit
+
+endif ; bWRITEIMAGES
+ptr_free, pCt
+file_delete, petDataFile, /QUIET
+
+; Write ROIs in MK format (one file per contour).
+if bWRITEROIs then begin
+
+	openr, lun, /GET_LUN, roiDataFile
+	rois = assoc( lun, bytarr( ctDims ) )
+
+	for iROI=0, nROIs-1 do begin
+		if strmatch( roiNames[iROI], 'LessionSegmenter', /FOLD_CASE ) then begin
+			; Claron generated ROIs don't have meaningful names. Prompt for new ROI 
+			; name of not specified in user_prefs.
+			if CLARON_ROI_NAME eq '' then begin
+				text = textBox( TITLE='Rename Claron ROI', $
+								LABEL=['New name: '], $
+								VALUE=[file_basename(rsFile)], $
+								CANCEL=bCancel )
+				if bCancel then begin
+					void = dialog_message( 'ROI not written.', /WARNING )
+					free_lun, lun
+				endif else begin
+					roiNames[iROI] = text[0]
+				endelse
+			endif else begin
+				roiNames[iROI] = CLARON_ROI_NAME
+			endelse
+		endif
+
+		; Check for existing files
+		fileName = writeDir + patId + '_' + time + '_' + roiNames[iROI] + '.img'
+		foundFiles = file_search( fileName, COUNT=nFiles )
+		suffix = ''
+		if nFiles gt 0 then suffix = curTime
+
+		fileName = writeDir + patId + '_' + time + suffix + '_' + roiNames[iROI] + '.img'
+		openw, fileOutUnit, fileName, /GET_LUN
+		writeu, fileOutUnit, rois[iROI]
+		close, fileOutUnit & free_lun, fileOutUnit
+		fileBase = (strsplit( file_basename( fileName ), ".", /EXTRACT ))[0]
+		txtFileName0 = writeDir + fileBase + '_info.txt'
+		openw, txtFileOutUnit, txtFileName0, /GET_LUN
+		printf, txtFileOutUnit, "Image Info"
+		printf, txtFileOutUnit, "=========="
+		printf, txtFileOutUnit, "nPx = ", strtrim( ctDims[0], 2 )
+		printf, txtFileOutUnit, "nPy = ", strtrim( ctDims[1], 2 )
+		printf, txtFileOutUnit, "nSlices = ", strtrim( ctDims[2], 2 )
+		printf, txtFileOutUnit, "pixSizeX (mm) = ", strtrim( ctPixSize[0], 2 )
+		printf, txtFileOutUnit, "pixSizeY (mm) = ", strtrim( ctPixSize[1], 2 )
+		printf, txtFileOutUnit, "pixSizeZ (mm) = ", strtrim( ctPixSize[2], 2 )
+		printf, txtFileOutUnit, "type = ", strtrim( size( rois[iROI], /TYPE ) )
+		printf, txtFileOutUnit, "type name = ", strtrim( size( rois[iROI], /TNAME ) )
+		free_lun, txtFileOutUnit
+	endfor
+	free_lun, lun
+
+endif ; bWRITEROIs
+file_delete, roiDataFile
+
+beep
+print, 'Done align_dynamic_petctrois'
+
+return, 1b
+
+end ; of align_dynamic_petctrois
